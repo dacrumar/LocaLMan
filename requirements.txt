@@ -1,9 +1,22 @@
+# ── LLM / RAG ──────────────────────────────────────────────────────────────────
 llama-index==0.12.7
 llama-index-vector-stores-chroma==0.4.1
 llama-index-embeddings-ollama==0.5.0
 llama-index-llms-ollama==0.5.0
 llama-index-readers-file==0.4.3
+
+# ── Vector store ───────────────────────────────────────────────────────────────
 chromadb==0.6.3
-rich==13.9.4
+
+# ── Parsers de documentos ──────────────────────────────────────────────────────
+pymupdf==1.25.5           # PDF (PyMuPDF / fitz)
+python-docx==1.1.2        # DOCX
+beautifulsoup4==4.12.3    # HTML
+openpyxl==3.1.5           # XLSX
+
+# ── Web server ─────────────────────────────────────────────────────────────────
 fastapi==0.115.5
 uvicorn[standard]==0.32.1
+
+# ── UI de terminal ─────────────────────────────────────────────────────────────
+rich==13.9.4

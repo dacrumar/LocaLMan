@@ -1,16 +1,21 @@
 """
 ingest.py
 -----------------
-Versión mejorada del pipeline de ingestión usando PyMuPDF como parser de PDFs.
-Más robusto para documentos con layouts complejos, columnas, tablas o texto escaneado.
+Pipeline de ingestión multi-formato. Parsea documentos, los trocea,
+genera embeddings y los almacena en ChromaDB.
+
+Formatos soportados:
+    .pdf   → PyMuPDF  (robusto con layouts complejos, columnas, tablas)
+    .docx  → python-docx
+    .html  → BeautifulSoup4 (extrae solo el texto, elimina tags)
+    .xlsx  → openpyxl (convierte cada fila en texto narrativo)
+    .txt   → lectura directa
+    .md    → lectura directa
 
 Uso:
     python ingest.py                  # procesa todo ./manuales
     python ingest.py --reset          # borra la BD y reinicia desde cero
-    python ingest.py --debug          # imprime los primeros 3 chunks de cada PDF
-
-Requiere:
-    pip install pymupdf llama-index-readers-file
+    python ingest.py --debug          # imprime los primeros 3 chunks de cada archivo
 """
 
 import os
@@ -21,6 +26,7 @@ try:
     posthog.capture = lambda *args, **kwargs: None
 except Exception:
     pass
+
 import sys
 import argparse
 from pathlib import Path
@@ -41,6 +47,8 @@ from llama_index.vector_stores.chroma import ChromaVectorStore
 import config
 
 console = Console()
+
+SUPPORTED_EXTS = {".pdf", ".docx", ".html", ".htm", ".xlsx", ".txt", ".md"}
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -64,88 +72,202 @@ def get_chroma_collection(reset: bool = False):
     return client, collection
 
 
-# ─── Carga de documentos con PyMuPDF ──────────────────────────────────────────
+# ─── Parsers por formato ───────────────────────────────────────────────────────
 
-def load_documents_pymupdf() -> list[Document]:
+def parse_pdf(path: Path) -> list:
+    """PyMuPDF: una página = un Document. Preserva layout, filtra líneas vacías."""
+    try:
+        import fitz
+    except ImportError:
+        console.print("[red]✗ PyMuPDF no instalado. Ejecuta: pip install pymupdf[/red]")
+        sys.exit(1)
+
+    docs = []
+    try:
+        doc = fitz.open(str(path))
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            text = page.get_text("text")
+            lines = [l for l in text.split("\n") if len(l.strip()) > 3]
+            text = "\n".join(lines).strip()
+            if not text:
+                continue
+            docs.append(Document(
+                text=text,
+                metadata={
+                    "file_name":   path.name,
+                    "file_path":   str(path),
+                    "page_label":  str(page_num + 1),
+                    "page":        page_num + 1,
+                    "total_pages": len(doc),
+                    "source":      "pymupdf",
+                    "format":      "pdf",
+                }
+            ))
+        doc.close()
+    except Exception as e:
+        console.print(f"  [red]✗[/red] {path.name} — Error PDF: {e}")
+    return docs
+
+
+def parse_docx(path: Path) -> list:
+    """python-docx: extrae párrafos no vacíos como un único Document."""
+    try:
+        import docx
+    except ImportError:
+        console.print("[red]✗ python-docx no instalado. Ejecuta: pip install python-docx[/red]")
+        return []
+    try:
+        doc = docx.Document(str(path))
+        paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+        text = "\n\n".join(paragraphs)
+        if not text:
+            return []
+        return [Document(
+            text=text,
+            metadata={"file_name": path.name, "file_path": str(path), "format": "docx"}
+        )]
+    except Exception as e:
+        console.print(f"  [red]✗[/red] {path.name} — Error DOCX: {e}")
+        return []
+
+
+def parse_html(path: Path) -> list:
+    """BeautifulSoup: elimina tags y scripts, extrae texto limpio."""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        console.print("[red]✗ beautifulsoup4 no instalado. Ejecuta: pip install beautifulsoup4[/red]")
+        return []
+    try:
+        html = path.read_text(encoding="utf-8", errors="ignore")
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup(["script", "style", "nav", "header", "footer", "noscript"]):
+            tag.decompose()
+        text = soup.get_text(separator="\n")
+        lines = [l.strip() for l in text.splitlines() if len(l.strip()) > 3]
+        text = "\n".join(lines)
+        if not text:
+            return []
+        return [Document(
+            text=text,
+            metadata={"file_name": path.name, "file_path": str(path), "format": "html"}
+        )]
+    except Exception as e:
+        console.print(f"  [red]✗[/red] {path.name} — Error HTML: {e}")
+        return []
+
+
+def parse_xlsx(path: Path) -> list:
     """
-    Carga PDFs usando PyMuPDF (fitz) directamente.
-    Cada página se convierte en un Document independiente con metadatos enriquecidos.
-    También carga TXT y MD con el reader estándar.
+    openpyxl: convierte cada hoja en texto narrativo.
+    Cada fila se representa como 'Columna: valor' para preservar contexto semántico.
     """
+    try:
+        import openpyxl
+    except ImportError:
+        console.print("[red]✗ openpyxl no instalado. Ejecuta: pip install openpyxl[/red]")
+        return []
+    docs = []
+    try:
+        wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            rows = list(ws.iter_rows(values_only=True))
+            if not rows:
+                continue
+            headers = [str(h).strip() if h is not None else f"Col{i}"
+                       for i, h in enumerate(rows[0])]
+            text_blocks = []
+            for row in rows[1:]:
+                parts = [f"{header}: {str(cell).strip()}"
+                         for header, cell in zip(headers, row)
+                         if cell is not None and str(cell).strip()]
+                if parts:
+                    text_blocks.append(" | ".join(parts))
+            if not text_blocks:
+                continue
+            docs.append(Document(
+                text="\n".join(text_blocks),
+                metadata={
+                    "file_name":  path.name,
+                    "file_path":  str(path),
+                    "sheet_name": sheet_name,
+                    "format":     "xlsx",
+                }
+            ))
+        wb.close()
+    except Exception as e:
+        console.print(f"  [red]✗[/red] {path.name} — Error XLSX: {e}")
+    return docs
+
+
+def parse_text(path: Path) -> list:
+    """TXT y MD: lectura directa."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore").strip()
+        if not text:
+            return []
+        return [Document(
+            text=text,
+            metadata={
+                "file_name": path.name,
+                "file_path": str(path),
+                "format":    path.suffix.lstrip("."),
+            }
+        )]
+    except Exception as e:
+        console.print(f"  [red]✗[/red] {path.name} — Error TXT/MD: {e}")
+        return []
+
+
+# ─── Router ───────────────────────────────────────────────────────────────────
+
+PARSERS = {
+    ".pdf":  parse_pdf,
+    ".docx": parse_docx,
+    ".html": parse_html,
+    ".htm":  parse_html,
+    ".xlsx": parse_xlsx,
+    ".txt":  parse_text,
+    ".md":   parse_text,
+}
+
+
+def load_documents() -> list:
     docs_path = Path(config.DOCS_DIR)
     if not docs_path.exists() or not any(docs_path.iterdir()):
         console.print(f"[red]✗ No hay documentos en '{config.DOCS_DIR}'.[/red]")
-        console.print("  Coloca PDFs, TXT o MD en esa carpeta y vuelve a ejecutar.")
+        console.print("  Coloca archivos PDF, DOCX, HTML, XLSX, TXT o MD en esa carpeta.")
         sys.exit(1)
 
-    try:
-        import fitz  # PyMuPDF
-    except ImportError:
-        console.print("[red]✗ PyMuPDF no está instalado.[/red]")
-        console.print("  Ejecuta: [bold]pip install pymupdf[/bold]")
+    all_files = [
+        f for f in sorted(docs_path.rglob("*"))
+        if f.is_file() and f.suffix.lower() in SUPPORTED_EXTS
+    ]
+
+    if not all_files:
+        console.print(f"[red]✗ No se encontraron archivos soportados en '{config.DOCS_DIR}'.[/red]")
+        console.print(f"  Formatos: {', '.join(sorted(SUPPORTED_EXTS))}")
         sys.exit(1)
 
-    documents: list[Document] = []
-    pdf_files  = sorted(docs_path.rglob("*.pdf"))
-    text_files = sorted(docs_path.rglob("*.txt")) + sorted(docs_path.rglob("*.md"))
+    by_ext: dict = {}
+    for f in all_files:
+        by_ext.setdefault(f.suffix.lower(), []).append(f)
 
-    if not pdf_files and not text_files:
-        console.print("[red]✗ No se encontraron archivos PDF, TXT ni MD.[/red]")
-        sys.exit(1)
+    summary = "  ".join(
+        f"[cyan]{ext}[/cyan]×{len(files)}" for ext, files in sorted(by_ext.items())
+    )
+    console.print(f"[cyan]📂 {len(all_files)} archivo(s) encontrado(s):[/cyan]  {summary}\n")
 
-    # ── PDFs con PyMuPDF ──
-    if pdf_files:
-        console.print(f"[cyan]📄 Parseando {len(pdf_files)} PDF(s) con PyMuPDF...[/cyan]")
-
-    for pdf_path in pdf_files:
-        try:
-            doc = fitz.open(str(pdf_path))
-            pages_loaded = 0
-            for page_num in range(len(doc)):
-                page = doc[page_num]
-
-                # Extrae texto con preservación de layout (mejor para columnas)
-                text = page.get_text("text")
-
-                # Limpieza básica: elimina líneas muy cortas (cabeceras/pies de página)
-                lines = text.split("\n")
-                lines = [l for l in lines if len(l.strip()) > 3]
-                text = "\n".join(lines).strip()
-
-                if not text:
-                    continue  # página vacía o solo imágenes
-
-                documents.append(Document(
-                    text=text,
-                    metadata={
-                        "file_name":  pdf_path.name,
-                        "file_path":  str(pdf_path),
-                        "page_label": str(page_num + 1),
-                        "page":       page_num + 1,
-                        "total_pages": len(doc),
-                        "source":     "pymupdf",
-                    }
-                ))
-                pages_loaded += 1
-
-            doc.close()
-            console.print(f"  [green]✓[/green] {pdf_path.name} — {pages_loaded} páginas")
-
-        except Exception as e:
-            console.print(f"  [red]✗[/red] {pdf_path.name} — Error: {e}")
-
-    # ── TXT / MD con reader estándar ──
-    if text_files:
-        console.print(f"\n[cyan]📝 Cargando {len(text_files)} archivo(s) de texto...[/cyan]")
-        from llama_index.core import SimpleDirectoryReader
-        for tf in text_files:
-            try:
-                reader = SimpleDirectoryReader(input_files=[str(tf)])
-                docs = reader.load_data()
-                documents.extend(docs)
-                console.print(f"  [green]✓[/green] {tf.name}")
-            except Exception as e:
-                console.print(f"  [red]✗[/red] {tf.name} — Error: {e}")
+    documents = []
+    for file_path in all_files:
+        ext = file_path.suffix.lower()
+        docs = PARSERS[ext](file_path)
+        if docs:
+            documents.extend(docs)
+            label = f"{len(docs)} página(s)" if ext == ".pdf" else "ok"
+            console.print(f"  [green]✓[/green] {file_path.name}  [dim]({label})[/dim]")
 
     console.print()
     return documents
@@ -153,13 +275,12 @@ def load_documents_pymupdf() -> list[Document]:
 
 # ─── Split ────────────────────────────────────────────────────────────────────
 
-def split_documents(documents: list[Document]):
+def split_documents(documents: list):
     splitter = SentenceSplitter(
         chunk_size=config.CHUNK_SIZE,
         chunk_overlap=config.CHUNK_OVERLAP,
     )
-    nodes = splitter.get_nodes_from_documents(documents, show_progress=False)
-    return nodes
+    return splitter.get_nodes_from_documents(documents, show_progress=False)
 
 
 # ─── Debug ────────────────────────────────────────────────────────────────────
@@ -168,8 +289,11 @@ def print_debug(nodes, n: int = 3):
     console.print(Rule("[yellow]DEBUG — primeros chunks[/yellow]"))
     for i, node in enumerate(nodes[:n]):
         meta = node.metadata or {}
-        console.print(f"\n[bold yellow]Chunk {i}[/bold yellow]  "
-                       f"[dim]{meta.get('file_name','?')} · pág. {meta.get('page_label','?')}[/dim]")
+        console.print(
+            f"\n[bold yellow]Chunk {i}[/bold yellow]  "
+            f"[dim]{meta.get('file_name','?')} · "
+            f"pág. {meta.get('page_label', meta.get('sheet_name', '—'))}[/dim]"
+        )
         console.print(node.text[:600])
         console.print()
     console.print(Rule())
@@ -182,15 +306,18 @@ def print_summary(documents, nodes):
     table.add_column("Métrica", style="dim")
     table.add_column("Valor", justify="right")
 
-    files = {doc.metadata.get("file_name", "desconocido") for doc in documents}
-    table.add_row("Páginas / documentos leídos", str(len(documents)))
-    table.add_row("Archivos únicos",             str(len(files)))
-    table.add_row("Chunks generados",            str(len(nodes)))
-    table.add_row("Chunk size",                  str(config.CHUNK_SIZE))
-    table.add_row("Chunk overlap",               str(config.CHUNK_OVERLAP))
-    table.add_row("Parser PDF",                  "PyMuPDF")
-    table.add_row("Modelo embeddings",           config.EMBED_MODEL)
-    table.add_row("LLM",                         config.LLM_MODEL)
+    files   = {doc.metadata.get("file_name", "?") for doc in documents}
+    formats = {doc.metadata.get("format",    "?") for doc in documents}
+
+    table.add_row("Archivos únicos",          str(len(files)))
+    table.add_row("Formatos",                 ", ".join(sorted(formats)))
+    table.add_row("Páginas / bloques leídos", str(len(documents)))
+    table.add_row("Chunks generados",         str(len(nodes)))
+    table.add_row("Chunk size",               str(config.CHUNK_SIZE))
+    table.add_row("Chunk overlap",            str(config.CHUNK_OVERLAP))
+    table.add_row("Parser PDF",               "PyMuPDF")
+    table.add_row("Modelo embeddings",        config.EMBED_MODEL)
+    table.add_row("LLM",                      config.LLM_MODEL)
 
     console.print(table)
     console.print()
@@ -219,11 +346,11 @@ def ingest(reset: bool = False, debug: bool = False):
         console.print(f"  [bold]ollama pull {config.EMBED_MODEL}[/bold]")
         sys.exit(1)
 
-    # 2. Cargar con PyMuPDF
-    documents = load_documents_pymupdf()
+    # 2. Cargar
+    documents = load_documents()
 
     # 3. Trocear
-    console.print(f"[cyan]✂  Troceando en chunks (size={config.CHUNK_SIZE}, overlap={config.CHUNK_OVERLAP})...[/cyan]")
+    console.print(f"[cyan]✂  Troceando (size={config.CHUNK_SIZE}, overlap={config.CHUNK_OVERLAP})...[/cyan]")
     nodes = split_documents(documents)
     console.print(f"  [green]✓[/green] {len(nodes)} chunks listos\n")
 
@@ -232,11 +359,11 @@ def ingest(reset: bool = False, debug: bool = False):
         print_debug(nodes)
 
     # 5. ChromaDB
-    _, collection = get_chroma_collection(reset=reset)
-    vector_store  = ChromaVectorStore(chroma_collection=collection)
+    _, collection   = get_chroma_collection(reset=reset)
+    vector_store    = ChromaVectorStore(chroma_collection=collection)
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
-    # 6. Embeddings y guardado
+    # 6. Embeddings + guardado en lotes
     console.print("[cyan]🧮 Generando embeddings y almacenando en ChromaDB...[/cyan]")
     console.print("  (puede tardar varios minutos según el volumen)\n")
 
@@ -268,7 +395,7 @@ def ingest(reset: bool = False, debug: bool = False):
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Ingestar manuales en ChromaDB usando PyMuPDF")
+    parser = argparse.ArgumentParser(description="Ingestar manuales en ChromaDB (multi-formato)")
     parser.add_argument("--reset", action="store_true",
                         help="Borrar la BD existente antes de ingestar")
     parser.add_argument("--debug", action="store_true",
